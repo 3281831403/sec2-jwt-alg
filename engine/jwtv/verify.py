@@ -57,14 +57,14 @@ def _decode_json_object(segment: str, label: str) -> dict[str, Any]:
     return value
 
 
-def _reencoded_signing_input(parts: dict[str, Any]) -> bytes:
-    header = json.dumps(
-        parts["header"], separators=(",", ":"), ensure_ascii=True
-    ).encode("utf-8")
-    payload = json.dumps(
-        parts["payload"], separators=(",", ":"), ensure_ascii=True
-    ).encode("utf-8")
-    return (_b64url_encode(header) + "." + _b64url_encode(payload)).encode("ascii")
+def _is_symmetric_key(key: Any) -> bool:
+    if isinstance(key, (bytes, bytearray, str)):
+        return True
+    return isinstance(key, dict) and key.get("kty") == "oct"
+
+
+def _is_asymmetric_key(key: Any) -> bool:
+    return isinstance(key, dict) and key.get("kty") == "RSA"
 
 
 def _secret_bytes(key: Any) -> bytes:
@@ -119,11 +119,11 @@ def split_token(text: str) -> dict[str, Any]:
     if not isinstance(text, str) or not text:
         raise ValueError("token must be non-empty text")
     segments = text.split(".")
-    if len(segments) < 2:
-        raise ValueError("token must contain a header and a payload")
+    if len(segments) != 3:
+        raise ValueError("token must contain exactly a header, a payload, and a signature")
     header_b64 = segments[0]
     payload_b64 = segments[1]
-    signature_b64 = segments[2] if len(segments) > 2 else ""
+    signature_b64 = segments[2]
     if not header_b64 or not payload_b64:
         raise ValueError("token header and payload must be present")
     header = _decode_json_object(header_b64, "header")
@@ -147,17 +147,28 @@ def check_alg(header: dict[str, Any], policy: dict[str, Any]) -> bool:
     if not isinstance(header, dict) or not isinstance(policy, dict):
         return False
     alg = header.get("alg")
-    return isinstance(alg, str) and bool(alg)
+    if not isinstance(alg, str) or not alg:
+        return False
+    algorithms = policy.get("algorithms")
+    if not isinstance(algorithms, (list, tuple, set)):
+        return False
+    return alg in algorithms
 
 
 def check_none(alg: str) -> bool:
     """Return whether an algorithm is a real, signed algorithm."""
-    return True
+    return isinstance(alg, str) and alg.lower() != "none"
 
 
 def check_key_type(alg: str, key: Any) -> bool:
     """Return whether key material is compatible with the algorithm."""
-    return True
+    if not isinstance(alg, str):
+        return False
+    if alg in _HS_ALGORITHMS:
+        return _is_symmetric_key(key)
+    if alg == "RS256":
+        return _is_asymmetric_key(key)
+    return False
 
 
 def verify_signature(parts: dict[str, Any], key: Any, alg: str) -> bool:
@@ -165,22 +176,22 @@ def verify_signature(parts: dict[str, Any], key: Any, alg: str) -> bool:
     if not isinstance(parts, dict) or not isinstance(alg, str):
         return False
     if alg.lower() == "none":
-        return True
+        return False
     signature_b64 = parts.get("signature_b64")
-    if not isinstance(signature_b64, str):
+    signing_input = parts.get("signing_input")
+    if not isinstance(signature_b64, str) or not isinstance(signing_input, bytes):
         return False
     try:
         signature = _b64url_decode(signature_b64)
     except ValueError:
         return False
-    signing_input = _reencoded_signing_input(parts)
     if alg in _HS_ALGORITHMS:
         try:
             secret = _secret_bytes(key)
         except ValueError:
             return False
         expected = hmac.new(secret, signing_input, _HS_ALGORITHMS[alg]).digest()
-        return expected == signature
+        return hmac.compare_digest(expected, signature)
     if alg == "RS256":
         return _rsa_verify(signing_input, signature, key)
     return False
@@ -192,10 +203,18 @@ def check_kid(header: dict[str, Any], keyring: list[dict[str, Any]]) -> dict[str
         raise ValueError("keyring must contain at least one key")
     kid = header.get("kid") if isinstance(header, dict) else None
     if not kid:
-        return keyring[0]
-    matches = [key for key in keyring if key.get("kid") == kid]
+        if len(keyring) == 1:
+            return keyring[0]
+        raise ValueError("key identifier is required")
+    matches = [
+        key
+        for key in keyring
+        if isinstance(key, dict) and key.get("kid") == kid
+    ]
     if not matches:
         raise ValueError("key identifier is unknown")
+    if len(matches) > 1:
+        raise ValueError("key identifier is ambiguous")
     return matches[0]
 
 
@@ -207,7 +226,9 @@ def validate_policy(policy: dict[str, Any]) -> list[str]:
     algorithms = policy.get("algorithms")
     if not isinstance(algorithms, (list, tuple, set)):
         algorithms = []
-    if policy.get("allow_none") is True or "none" in algorithms:
+    if policy.get("allow_none") is True or any(
+        isinstance(alg, str) and alg.lower() == "none" for alg in algorithms
+    ):
         issues.append("none algorithm is allowed")
     key_types = policy.get("key_types")
     if not isinstance(key_types, dict) or not key_types:
@@ -228,8 +249,10 @@ def jwt_batch(tokens: list[str], policy: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(keyring, (list, tuple)):
         keyring = []
     policy_issues = validate_policy(policy)
+    key_types = policy.get("key_types") if isinstance(policy, dict) else None
+    if not isinstance(key_types, dict):
+        key_types = {}
     results: list[dict[str, Any]] = []
-    shared_key: Any = None
     if policy_issues:
         for index in range(len(token_list)):
             results.append(
@@ -249,9 +272,11 @@ def jwt_batch(tokens: list[str], policy: dict[str, Any]) -> dict[str, Any]:
                 key = check_kid(header, keyring)
                 if not check_key_type(alg, key):
                     raise ValueError("key type does not match algorithm")
-                if shared_key is None:
-                    shared_key = key
-                key = shared_key
+                declared = key_types.get(alg)
+                if declared == "symmetric" and not _is_symmetric_key(key):
+                    raise ValueError("key type does not match policy")
+                if declared == "asymmetric" and not _is_asymmetric_key(key):
+                    raise ValueError("key type does not match policy")
                 if not verify_signature(parts, key, alg):
                     raise ValueError("signature verification failed")
                 if isinstance(key, dict) and isinstance(key.get("kid"), str):
